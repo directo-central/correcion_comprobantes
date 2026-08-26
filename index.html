@@ -74,6 +74,15 @@ input:focus,textarea:focus,select:focus,.editor:focus{border-color:var(--blue);b
 .flag.auto{background:var(--green-tint);color:var(--green)}
 .flag.man{background:var(--amber-tint);color:var(--amber)}
 
+.cmp{margin-top:12px;display:grid;gap:10px}
+.cmp-lbl{display:block;font-size:10px;font-weight:700;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--ink-3);margin-bottom:4px}
+.cmp-lbl.ok{color:var(--green)}
+.cmp-img{background:#fff;border:1px solid var(--line);border-radius:6px;
+  padding:5px 6px;overflow-x:auto;min-height:28px}
+.cmp-img canvas{display:block;box-shadow:none;border-radius:0;max-width:none}
+.cmp-img .ph{font-size:11px;color:var(--ink-3);padding:5px 2px}
+
 .tools{display:flex;flex-wrap:wrap;gap:3px;padding:6px;border:1px solid var(--line);border-bottom:0;border-radius:8px 8px 0 0;background:var(--paper)}
 .tools button{background:transparent;border:1px solid transparent;border-radius:6px;min-width:30px;height:28px;padding:0 6px;display:grid;place-items:center;color:var(--ink-2);font-size:13px;font-weight:600;cursor:pointer}
 .tools button:hover{background:var(--white);border-color:var(--line)}
@@ -220,6 +229,12 @@ canvas{max-width:none;height:auto;box-shadow:0 2px 14px rgba(15,27,45,.16);borde
               <b>La razón social se imprime encima del bloque de la derecha.</b>
               Viene así del emisor. Puedes repartirla en varias líneas sin
               cambiar ni un carácter — el texto se verifica antes de aplicarlo.
+              <div class="cmp" id="ovCmp" style="display:none">
+                <div><span class="cmp-lbl">Como está ahora</span>
+                     <div class="cmp-img" id="ovBefore"></div></div>
+                <div><span class="cmp-lbl ok">Como quedaría</span>
+                     <div class="cmp-img" id="ovAfter"></div></div>
+              </div>
               <div style="margin-top:9px">
                 <button type="button" class="act b-ghost b-sm" id="btnFixName">
                   Corregir nombre superpuesto</button>
@@ -348,7 +363,7 @@ const AUDIT_ENDPOINT = "https://script.google.com/macros/s/AKfycbzHb5gKb36CweCYH
 
 /* Identificador de compilación. Sirve para confirmar qué versión está
    publicada: aparece al pie y en el registro de la pantalla. */
-const VERSION = "2026-08-26-g";
+const VERSION = "2026-08-26-h";
 
 /* Se usan solo si la hoja no responde */
 const MOTIVOS_FALLBACK = [
@@ -531,7 +546,15 @@ function detectHeaderOverlap(items, tablaY){
       der: streams.slice(1).reduce((a,s)=>a.concat(s.its),[]).map(i=>({
         t:i.s, x:i.x, y:i.y, size:+i.h.toFixed(2), bold:i.h > fs + 0.5
       })),
-      topY: Math.max.apply(null, rows[k].its.map(i=>i.y + i.h*0.85)) + 0.5
+      topY: Math.max.apply(null, rows[k].its.map(i=>i.y + i.h*0.85)) + 0.5,
+      // Banda para el recorte antes/después: la fila completa más la
+      // siguiente, para que se vea que no hay colisión debajo.
+      banda: {
+        l   : Math.min.apply(null, rows[k].its.map(i=>i.x)) - 3,
+        r   : Math.max.apply(null, streams.map(s=>s.r)) + 3,
+        top : Math.max.apply(null, rows[k].its.map(i=>i.y + i.h*0.9)) + 2,
+        bot : sigY - 3.5
+      }
     };
   }
   return null;
@@ -915,7 +938,7 @@ function reflowCabecera(page, F, ov, rgb){
   return {ok:true,lineas:lns.length,fs};
 }
 
-async function buildPDF(){
+async function buildPDF(forzarReflow){
   const {PDFDocument,StandardFonts,rgb}=PDFLib;
   const raw=parseBlocks(editor);
   const dropped=new Set();
@@ -984,7 +1007,7 @@ async function buildPDF(){
       y-=L.lead;
     });
   }
-  const reflow = (S.fixName && p.overlap)
+  const reflow = ((forzarReflow || S.fixName) && p.overlap)
     ? reflowCabecera(page,F,p.overlap,rgb) : null;
 
   return {bytes:await doc.save(),fit:L,dropped:[...dropped],reflow,
@@ -1144,6 +1167,8 @@ async function load(f){
   $("btnFixName").classList.remove("b-main");
   $("btnFixName").classList.add("b-ghost");
   $("btnFixName").textContent="Corregir nombre superpuesto";
+  $("btnFixName").disabled=false;
+  $("ovCmp").style.display="none";
   $("ovBox").style.display = p.overlap ? "block" : "none";
   if(p.overlap) logLine(`Cabecera: "${p.overlap.etiqueta||"razón social"}" se solapa con el bloque derecho.`);
   $("metaBox").style.display="block";
@@ -1162,6 +1187,7 @@ async function load(f){
   if(av.length) msg("parseMsg","warn",av.join("<br><br>"));
 
   await render(S.origBytes.slice(0),"Original");
+  if(p.overlap) muestraCabecera();
   gate();
 }
 
@@ -1423,15 +1449,62 @@ function repaint(){
   if(S.lastPdfBytes) render(S.lastPdfBytes.slice(0),"Con texto nuevo");
   else if(S.origBytes&&S.parsed) render(S.origBytes.slice(0),"Original");
 }
+/* ══════════════════════════════════════════════════════════════
+   MUESTRA ANTES / DESPUÉS
+   Recorta solo la fila afectada, para no obligar a revisar la hoja
+   entera con zoom cada vez que se corrige el nombre.
+   ══════════════════════════════════════════════════════════════ */
+async function cropRender(bytes, b, el){
+  const pdf=await pdfjsLib.getDocument({data:new Uint8Array(bytes)}).promise;
+  const page=await pdf.getPage(1);
+  const base=page.getViewport({scale:1});
+  const cw=Math.max(20,b.r-b.l), chh=Math.max(8,b.top-b.bot);
+  const disp=Math.max(200, el.clientWidth-14);
+  // Piso de escala: a tamaño real el texto de 7 pt es ilegible en pantalla.
+  // Si no entra a lo ancho, el recorte permite desplazamiento lateral.
+  const sc=Math.max(1.4, Math.min(2.5, disp/cw));
+  const dpr=window.devicePixelRatio||1;
+  const vp=page.getViewport({scale:sc*dpr,
+    offsetX:-b.l*sc*dpr, offsetY:-(base.height-b.top)*sc*dpr});
+  const cv=document.createElement("canvas");
+  cv.width=Math.ceil(cw*sc*dpr); cv.height=Math.ceil(chh*sc*dpr);
+  cv.style.width=Math.round(cw*sc)+"px";
+  const ctx=cv.getContext("2d");
+  ctx.fillStyle="#fff"; ctx.fillRect(0,0,cv.width,cv.height);
+  await page.render({canvasContext:ctx,viewport:vp}).promise;
+  el.innerHTML=""; el.appendChild(cv);
+}
+
+async function muestraCabecera(){
+  const p=S.parsed;
+  if(!p || !p.overlap){ $("ovCmp").style.display="none"; return; }
+  const b=p.overlap.banda;
+  $("ovCmp").style.display="grid";
+  $("ovBefore").innerHTML='<div class="ph">Cargando…</div>';
+  $("ovAfter").innerHTML='<div class="ph">Cargando…</div>';
+  try{
+    await cropRender(S.origBytes.slice(0), b, $("ovBefore"));
+    const r=await buildPDF(true);
+    if(r.reflow && !r.reflow.ok){
+      $("ovAfter").innerHTML='<div class="ph" style="color:var(--red)">'+esc(r.reflow.error)+'</div>';
+      $("btnFixName").disabled=true;
+      return;
+    }
+    await cropRender(r.bytes, b, $("ovAfter"));
+    if(r.reflow) $("ovState").textContent = S.fixName ? "" : `Quedaría en ${r.reflow.lineas} líneas`;
+  }catch(err){
+    $("ovCmp").style.display="none";
+    logLine("No se pudo generar la muestra de cabecera: "+err.message,"err");
+  }
+}
+
 $("btnFixName").addEventListener("click",()=>{
   S.fixName=!S.fixName;
   const b=$("btnFixName");
   b.classList.toggle("b-main",S.fixName);
   b.classList.toggle("b-ghost",!S.fixName);
   b.textContent = S.fixName ? "Deshacer corrección" : "Corregir nombre superpuesto";
-  $("ovState").textContent = S.fixName ? "Aplicando… revisa la vista previa" : "";
-  S.viewMode="page";
-  for(const x of $("segView").children) x.classList.toggle("on", x.dataset.view==="page");
+  $("ovState").textContent = "";
   clearTimeout(prevTimer); runPreview();
 });
 
